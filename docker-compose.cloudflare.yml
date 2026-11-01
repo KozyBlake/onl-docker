@@ -1,0 +1,82 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Cloudflare Tunnel overlay for onl-docker.
+#
+# This is OUR layer — not upstream. It is applied on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cloudflare.yml up -d
+#
+# (or:  make run COMPOSE="docker compose -f docker-compose.yml -f docker-compose.cloudflare.yml")
+#
+# What it does, and why each piece exists for the "origin IP is never exposed"
+# requirement:
+#   1. Drops the host port bindings on bancho/shiina (`ports: !reset`) so NOTHING
+#      is published to the host. All traffic flows tunnel -> nginx -> services,
+#      entirely inside the Docker network.
+#   2. Adds an nginx container that routes by Host header to bancho/shiina.
+#   3. Adds a cloudflared container: outbound-only to Cloudflare (:7844), no
+#      inbound ports, no router forwarding. DNS is CNAMEs to the tunnel, never
+#      an A record at the home IP.
+#
+# Requires in .env (gitignored):  DOMAIN=...   CF_TUNNEL_TOKEN=...
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # Remove host-facing port publishing — internal-only behind the tunnel.
+  bancho:
+    ports: !reset []
+
+  shiina:
+    ports: !reset []
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: onl-nginx
+    depends_on:
+      bancho:
+        condition: service_healthy
+      shiina:
+        condition: service_started
+    environment:
+      # Only DOMAIN is substituted into the template; nginx $vars are preserved.
+      DOMAIN: ${DOMAIN}
+      NGINX_ENVSUBST_FILTER: "DOMAIN"
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./.data/bancho/avatars:/srv/avatars:ro
+      - ./.data/bancho/assets:/srv/assets:ro
+      - ./.data/nginx:/var/log/nginx
+    # No `ports:` — nginx is reachable only from cloudflared on the compose network.
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:2024.12.2
+    container_name: onl-cloudflared
+    depends_on:
+      nginx:
+        condition: service_started
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN}
+      # This network drops UDP/QUIC (and a VPN was blocking 7844); force http2/TCP.
+      TUNNEL_TRANSPORT_PROTOCOL: http2
+    # Outbound-only to Cloudflare. No ports published, ever.
+    restart: unless-stopped
+
+  # Daily incremental beatmap-status sync. Reuses the bancho image (has Python,
+  # tools/sync_maps.py, requests, pymysql). Keeps the maps table matching osu!'s
+  # official Ranked/Approved/Loved status as new maps get ranked. Full initial
+  # sync is a manual `docker exec onl-bancho python tools/sync_maps.py`.
+  mapsync:
+    image: onl-docker-bancho
+    container_name: onl-mapsync
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      - DB_USER=${DB_USER}
+      - DB_PASS=${DB_PASS}
+      - DB_NAME=${DB_NAME}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+    command: sh -c "sleep 60; while true; do python tools/sync_maps.py recent || true; sleep 86400; done"
+    restart: unless-stopped

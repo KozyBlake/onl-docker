@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# osu! reverse-proxy for the Cloudflare Tunnel path.
+#
+# Runs inside an nginx container on the compose network. Cloudflared sends all
+# tunnel traffic here over plain HTTP on :80 — TLS terminates at Cloudflare's
+# edge, so there are no certs here and nothing is exposed to the host. nginx
+# routes by Host header to the right backend by SERVICE NAME.
+#
+# IMPORTANT: proxy by a *variable* + Docker's embedded DNS resolver (127.0.0.11)
+# so nginx RE-RESOLVES the backend IP at request time. A static `upstream {}`
+# block resolves only once at startup and breaks with "502 / connection refused"
+# whenever bancho/shiina get recreated and change IP. Do not reintroduce it.
+#
+# Only ${DOMAIN} is substituted at start (NGINX_ENVSUBST_FILTER=DOMAIN); every
+# nginx runtime variable ($host, $bancho, …) is left untouched.
+# ─────────────────────────────────────────────────────────────────────────────
+
+resolver 127.0.0.11 valid=10s ipv6=off;
+
+# bancho: chat/multiplayer (c.*), plus /web, /api, redirects (osu., b., api.).
+# i. and s. are routed here too so bancho's REDIRECT_OSU_URLS can bounce them
+# to osu!'s CDN (onl-docker's installer omits these; the brief wants them present).
+server {
+    listen 80;
+    server_name c.${DOMAIN} ce.${DOMAIN} c4.${DOMAIN} osu.${DOMAIN} b.${DOMAIN} api.${DOMAIN} i.${DOMAIN} s.${DOMAIN};
+    client_max_body_size 20M;
+
+    location / {
+        set $bancho bancho:10010;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Host $http_host;
+        add_header Access-Control-Allow-Origin *;
+        proxy_redirect off;
+        proxy_pass http://$bancho;
+    }
+}
+
+# website (Shiina)
+server {
+    listen 80 default_server;
+    server_name ${DOMAIN};
+    client_max_body_size 20M;
+
+    location / {
+        set $shiina shiina:8080;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Host $http_host;
+        add_header Access-Control-Allow-Origin *;
+        proxy_redirect off;
+        proxy_pass http://$shiina;
+    }
+}
+
+# avatars (served from the bancho data volume)
+server {
+    listen 80;
+    server_name a.${DOMAIN};
+
+    location / {
+        root /srv/avatars;
+        try_files $uri $uri.png $uri.jpg $uri.gif $uri.jpeg $uri.jfif /default.jpg =404;
+    }
+}
+
+# static assets (served from the bancho data volume)
+server {
+    listen 80;
+    server_name assets.${DOMAIN};
+
+    location / {
+        default_type image/png;
+        root /srv/assets;
+    }
+}
