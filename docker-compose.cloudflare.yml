@@ -22,8 +22,11 @@
 
 services:
   # Remove host-facing port publishing — internal-only behind the tunnel.
+  # Also give bancho the restart policy the base compose omits, so it comes
+  # back on reboot like every other service.
   bancho:
     ports: !reset []
+    restart: unless-stopped
 
   shiina:
     ports: !reset []
